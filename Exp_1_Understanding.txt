@@ -1,0 +1,152 @@
+#ifdef DEV_TYPE_RFD                                   		 //Compile for a Reduced Function Device (RFD). When this is defined, it is not allowed to define DEV_TYPE_FFD, PAN_COORD, PAN_COORD_NO_MESH, or GW_ENA. Likewise, RFD application enabling flags should not be used.
+#ifdef RFD_APP_0                                       		 // WiSense platform code includes some RFD applications as examples. Only one RFD application can be enabled at any one time. This is sufficient because a single application can handle multiple sensors. One of these flags must be defined to enable that specific RFD application. These flags are applicable only when RFD_APP is defined.
+
+#if defined(PLTFRM_ON_CHIP_VCC_SENSE_ENA) \                  //Enable platform code for interfacing to MSP430 on-chip temperature sensor.
+    && defined(PLTFRM_ON_CHIP_TEMP_SENSOR_ENA)               //Enable platform code for interfacing to MSP430 on-chip battery voltage sensor.
+
+#include <typedefs.h>											                                  
+#include <system.h>    
+#include <pltfrm.h>
+#include <util.h>
+#include <mac_pib.h>
+#include <adp.h>
+#include <rfd_app.h>
+
+#define RFD_APP_DATA_SEQ_NR_SZ   2                       
+#define RFD_APP_DATA_SNSR_BIT_MSK_SZ   1
+
+UINT16_t RFD_APP_pktSeqNr = 0;
+
+// Stats
+UINT16_t RFD_APP_dataTxReqCnt = 0;              			//uint16_t is unsigned 16-bit integer for data write request counter
+UINT16_t RFD_APP_dataRxReqFailCnt = 0;						//uint16_t is unsigned 16-bit integer for data read failure counter
+UINT16_t RFD_APP_cnfrmOkCnt = 0; 							//uint16_t is unsigned 16-bit integer for confirmation counter
+UINT16_t RFD_APP_cnfrmFlrCnt = 0;               			//uint16_t is unsigned 16-bit integer for confirmation failure counter
+
+void RFD_APP_buildSendSnsrUpdate(void)          
+{
+   UINT8_t pktLen = ADP_ELEMENT_TYPE_LEN    				// allocating size for the packet to be sent out 
+                    + RFD_APP_DATA_SEQ_NR_SZ
+                    + RFD_APP_DATA_SNSR_BIT_MSK_SZ
+                    + PLTFRM_ON_CHIP_VCC_SENSOR_OUTPUT_LEN
+                    + PLTFRM_ON_CHIP_TEMP_SENSOR_OUTPUT_LEN;
+
+
+   // seq-nr                            <2 bytes>
+   // bit mask                          <1 byte / 3 bits valid (0, 1 and 2)>
+   // On chip Vcc sensor o/p            <2 bytes>
+   // Internal temp sensor o/p          <2 bytes>
+   //Stores the ADP context. This is used by application code. The gateway uses it. Memory handles and associated parameters are passed in and out of ADP layer using this variable.
+   ADP_cntxt.txParams.bdHndl = SYS_allocMem(pktLen);    //Allocates memory of the required number of bytes using the global buffer descriptor list SYS_buffDescList.
+                               // SYS_allocMem() comes from system.h also ADP_cntxt.txParams comes from adp.h where its struct is defined 
+   if (SYS_BD_HNDL_IS_VALID(ADP_cntxt.txParams.bdHndl))    
+   {
+       UINT8_t *buff_p = SYS_GET_BD_BUFF(ADP_cntxt.txParams.bdHndl);    // comes from system.h 
+       UINT8_t *flag_p, snsrFlag = 0x0;    // What is this ?
+
+       buff_p += ADP_ELEMENT_TYPE_LEN;   // defined in adp.h
+
+       RFD_APP_pktSeqNr ++;     
+       buff_p = UTIL_htons(buff_p, RFD_APP_pktSeqNr); //Convert 16-bit value from host to network order. Note that MSP430 is Little Endian while networking is Big Endian.
+Parameters:	
+    buff_p – Pointers to buffer where value is to be stored. Function expects pre-allocated valid memory.
+    val – Value that needs to be converted.
+Returns Points to next free location in buffer after conversion. In other words, this is a modification of input pointer buff_p.
+      //
+       flag_p = buff_p;
+       buff_p ++;  // skip sensor flag field ...
+
+       {
+          UINT16_t vcc = 0;
+          pltfrm_vccSenseInit( );   				    // defined in platform.h SIZE 2 
+          vcc = pltfrm_vccSense();		  				// Read Voltage Value  Note: This is defined in pltfrm.h it is one of the few in lower case  
+          buff_p = UTIL_htons(buff_p, vcc);             // Will store value into buff_p note buff_p must be pre-allocated
+          snsrFlag |= BIT0;
+       }
+
+       {
+          SINT16_t temp16 = 0;
+          PLTFRM_onChipTempSensorInit();
+          temp16 = PLTFRM_readOnChipTempSensor();		// Read temp sensor value   Question why is this SINT16_t and rest UNIT16_t
+          buff_p = UTIL_htons(buff_p, temp16);
+          snsrFlag |= BIT1;
+       }
+
+       *flag_p = snsrFlag;
+
+       ADP_cntxt.txParams.destShortAddr = LPWMN_COORD_MAC_SHORT_ADDR;  //  For example, an RFD sending sensor data will typically sent it to the PAN coordinator whose address is set as LPWMN_COORD_MAC_SHORT_ADDR.
+
+       RFD_APP_dataTxReqCnt ++;    // Increase counter of sent request 
+
+       if (ADP_appPyldTxReq() != ADP_STS_SUCCESS)      //This request to send payload on the wireless channel comes from the application layer. As a special case, the gateway can also request transmission. Parameters of the transmission are passed into this function via the global variable ADP_cntxt
+       {
+           RFD_APP_dataRxReqFailCnt ++;    // If sending process fails then counter is increased
+           SYS_globalEvtMsk1 |= SYS_GLOBAL_EVT_ENTER_LPM_REQUEST;
+       }
+   }
+}
+
+void RFD_APP_wakeUpProc( )                         // This makes the mcu go from active to sleep 
+{
+   RFD_APP_buildSendSnsrUpdate();
+}
+
+void RFD_APP_nodeJoinDoneInd(void)                 // This makes the node go from init to sleep
+{
+   RFD_APP_wakeUpProc( );
+}
+
+void RFD_APP_prepareToEnterLPM(void)               // This state takes the MCU from Prepare to Sleep to Sleep State 
+{
+   // Interrupts are disabled globally at this point.
+   // The MSP430 will go into deep sleep mode on returning
+   // from this function.
+   return;
+}
+
+void RFD_APP_wakeUpTimerExpEvt(void)           // State changes from awake to active
+{
+   return;
+}
+
+void APP_procGPIOEvt()                        // What is this for ?
+{
+   return;                        
+}
+
+void RFD_APP_evtHndlr(UINT16_t globalEvtId, void *params_p)        // Active to prepare to sleep This function handles messages coming to an RFD. It could be a confirmation to sensor data sent out earlier. This confirmation comes as SYS_GLOBAL_EVT_ADP_DATA_CONFIRM set in SYS_globalEvtMsk0. Presently every transmission of sensor data requires an acknowledgement back to the RFD. This behaviour can be changed by modifying the API of ADP layer. Another possible event is due to SYS_GLOBAL_EVT_ADP_DATA_INDICATION set in SYS_globalEvtMsk1.
+An application may choose to ignore these events if they are not important. At the minimum, the function should set SYS_GLOBAL_EVT_ENTER_LPM_REQUEST in SYS_globalEvtMsk1 so that the RFD returns to sleep mode. It is important to note that an RFD will not be woken up from its sleep because of an incoming message. It is only when the RFD wakes up from its sleep cycle that it will check with PAN coordinator if any messages are to be received.
+{
+   switch (globalEvtId)
+   {
+      case SYS_GLOBAL_EVT_ADP_DATA_CONFIRM:
+           {
+              ADP_dataCnfrmParams_s *dcParams_p = (ADP_dataCnfrmParams_s *)params_p;
+              if (dcParams_p->sts == ADP_STS_SUCCESS)
+              {
+                  RFD_APP_cnfrmOkCnt ++;
+              }
+              else
+              {
+                  RFD_APP_cnfrmFlrCnt ++;
+              }
+              SYS_globalEvtMsk1 |= SYS_GLOBAL_EVT_ENTER_LPM_REQUEST;            
+           }
+           break;
+
+      default:
+           break;
+   }
+
+   return;
+}
+//This variable is applicable only for an RFD. Such devices go into sleep and wakeup periodically. This variable determines the sleep time. It is used in calling PLTFRM_startWakeUpTimer(). Subsequently, the RFD enters sleep mode. The variable is initialized to zero. It is the application’s responsibility to set it to a suitable value. Value is in seconds. To set the value, macro SYS_SET_WAKEUP_INTERVAL() is to be used.
+void RFD_APP_init(void)
+{
+   SYS_SET_WAKEUP_INTERVAL(RFD_APP_0_DFLT_WAKE_UP_INTERVAL_SECS);
+   return;
+}
+
+#endif
+#endif
+#endif
